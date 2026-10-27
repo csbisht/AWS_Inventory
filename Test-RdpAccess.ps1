@@ -1,42 +1,33 @@
 <#
 .SYNOPSIS
-    Tests whether a user can RDP into multiple Windows servers using only built-in
-    Windows tools (mstsc, cmdkey, quser, logoff). No FreeRDP needed.
+    CLI-only RDP access check for multiple Windows servers. No GUI, no session created.
 
 .DESCRIPTION
-    Mode Session (default) - real RDP test:
-        1. Checks TCP 3389
-        2. Caches creds with cmdkey and launches mstsc
-        3. Polls the target with 'quser' until the test user's session appears (= access YES)
-        4. Logs the test session off and closes mstsc
-       Requirements: run from a desktop session (mstsc is GUI), and the account
-       RUNNING the script must be able to run 'quser'/'logoff' against the targets
-       (normally local admin on the target). Don't touch the mouse/keyboard while it runs.
-
-    Mode Precheck - headless, no login:
-        Port 3389 + validates the password + checks 'Remote Desktop Users' /
-        'Administrators' membership over WinRM. Direct membership only, nested
-        groups are not expanded.
+    Per server:
+      1. TCP 3389 reachable
+      2. RDP enabled on server (fDenyTSConnections = 0)
+      3. Password valid for the test user
+      4. User's effective groups (incl. nested) hold SeRemoteInteractiveLogonRight
+         ("Allow log on through RDS") and NOT SeDenyRemoteInteractiveLogonRight
+    Steps 2 and 4 run on the target via WinRM as the account EXECUTING this script
+    (needs local admin on target + WinRM enabled).
 
 .EXAMPLE
     .\Test-RdpAccess.ps1 -ServerFile .\servers.txt
 .EXAMPLE
-    .\Test-RdpAccess.ps1 -Servers srv01,srv02 -Mode Precheck
+    .\Test-RdpAccess.ps1 -Servers srv01,srv02
 #>
 [CmdletBinding()]
 param(
     [string[]]$Servers,
     [string]$ServerFile,
-    [ValidateSet('Session','Precheck')]
-    [string]$Mode = 'Session',
-    [int]$TimeoutSec = 45,
     [int]$Port = 3389,
     [string]$OutCsv = ".\rdp-test-$(Get-Date -Format yyyyMMdd-HHmmss).csv"
 )
 
 # ====================== HARDCODED TEST CREDENTIALS ======================
 # Domain account : "DOMAIN\testuser" or "testuser@corp.example.com"
-# Local account  : ".\localuser"  (auto-expanded to SERVERNAME\localuser per host)
+# Local account  : ".\localuser"  (checked as a local user on each server)
 $User = "DOMAIN\testuser"
 $Pass = "P@ssw0rd!"
 # ========================================================================
@@ -44,121 +35,100 @@ $Pass = "P@ssw0rd!"
 if ($ServerFile) { $Servers += Get-Content $ServerFile | Where-Object { $_.Trim() -and $_ -notmatch '^\s*#' } }
 if (-not $Servers) { throw "No servers supplied. Use -Servers or -ServerFile." }
 
-function Get-UserForServer([string]$server) {
-    if ($User -like '.\*') { "$($server.Split('.')[0])\$($User.Substring(2))" } else { $User }
-}
+Add-Type -AssemblyName System.DirectoryServices.AccountManagement
 
-function Get-ShortName([string]$u) {
-    if ($u -like '*\*') { $u = $u.Split('\')[1] }
-    if ($u -like '*@*') { $u = $u.Split('@')[0] }
-    $u.Substring(0, [Math]::Min(20, $u.Length))   # quser truncates at 20 chars
-}
+$IsLocal = $User -like '.\*'
+$Sam = $User
+if ($Sam -like '*\*') { $Sam = $Sam.Split('\')[1] }
+if ($Sam -like '*@*') { $Sam = $Sam.Split('@')[0] }
 
-function Get-RdpSessionIds([string]$server, [string]$shortName) {
-    $out = quser /server:$server 2>$null
-    foreach ($line in $out | Select-Object -Skip 1) {
-        if ($line -match '^\s*>?(?<user>\S+)\s+(?:(?<sess>\S+)\s+)?(?<id>\d+)\s+(?<state>\S+)') {
-            if ($Matches.user -ieq $shortName) { [int]$Matches.id }
+# Runs ON the target server
+$remoteCheck = {
+    param($sam, $isLocal)
+    $o = [ordered]@{ RdpEnabled = $false; Allowed = $false; Detail = '' }
+
+    $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+    $o.RdpEnabled = ($ts.fDenyTSConnections -eq 0)
+
+    # --- Effective SIDs of the user (user + all groups, nested, incl. local groups) ---
+    if ($isLocal) {
+        $u = Get-LocalUser -Name $sam -ErrorAction Stop
+        if (-not $u.Enabled) { $o.Detail = 'Local account disabled'; return [pscustomobject]$o }
+        $sids = @($u.SID.Value, 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545')
+        foreach ($g in Get-LocalGroup) {
+            if (Get-LocalGroupMember $g -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $u.SID }) { $sids += $g.SID.Value }
+        }
+    } else {
+        $res = ([adsisearcher]"(&(objectCategory=user)(sAMAccountName=$sam))").FindOne()
+        if (-not $res) { $o.Detail = "User $sam not found in AD"; return [pscustomobject]$o }
+        $upn = $res.Properties['userprincipalname'] | Select-Object -First 1
+        if (-not $upn) { $o.Detail = "User $sam has no UPN; can't build token"; return [pscustomobject]$o }
+        $id = [Security.Principal.WindowsIdentity]::new($upn)   # S4U token, includes nested + local groups
+        $sids = @($id.User.Value) + @($id.Groups | ForEach-Object { $_.Value })
+    }
+
+    # --- User rights on this server ---
+    $tmp = Join-Path $env:TEMP "ur_$([guid]::NewGuid()).inf"
+    secedit /export /areas USER_RIGHTS /cfg $tmp | Out-Null
+    $cfg = Get-Content $tmp
+    Remove-Item $tmp -Force
+
+    function Get-RightSids($name) {
+        $line = $cfg | Where-Object { $_ -match "^$name\s*=" }
+        if (-not $line) { return @() }
+        ($line -replace "^$name\s*=\s*", '') -split ',' | ForEach-Object {
+            $e = $_.Trim()
+            if ($e.StartsWith('*')) { $e.TrimStart('*') }
+            else { try { ([Security.Principal.NTAccount]$e).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $e } }
         }
     }
+    function Get-Name($sid) {
+        try { ([Security.Principal.SecurityIdentifier]$sid).Translate([Security.Principal.NTAccount]).Value } catch { $sid }
+    }
+
+    $allowHit = @(Get-RightSids 'SeRemoteInteractiveLogonRight'     | Where-Object { $_ -in $sids })
+    $denyHit  = @(Get-RightSids 'SeDenyRemoteInteractiveLogonRight' | Where-Object { $_ -in $sids })
+
+    if ($denyHit)      { $o.Detail = "DENIED via: " + (($denyHit | ForEach-Object { Get-Name $_ }) -join ', ') }
+    elseif ($allowHit) { $o.Allowed = $true; $o.Detail = "Allowed via: " + (($allowHit | ForEach-Object { Get-Name $_ }) -join ', ') }
+    else               { $o.Detail = "No 'Allow log on through RDS' right (not in Remote Desktop Users/Administrators)" }
+
+    [pscustomobject]$o
 }
 
-# Suppress the "identity of the remote computer cannot be verified" prompt during the run
-$tsKey = 'HKCU:\Software\Microsoft\Terminal Server Client'
-$origAuthLevel = $null
-if ($Mode -eq 'Session') {
-    if (-not (Test-Path $tsKey)) { New-Item $tsKey -Force | Out-Null }
-    $origAuthLevel = (Get-ItemProperty $tsKey -Name AuthenticationLevelOverride -ErrorAction SilentlyContinue).AuthenticationLevelOverride
-    Set-ItemProperty $tsKey -Name AuthenticationLevelOverride -Value 0 -Type DWord
-}
-
-try {
 $results = foreach ($server in $Servers) {
-    $server  = $server.Trim()
-    $rdpUser = Get-UserForServer $server
-    $short   = Get-ShortName $rdpUser
-    Write-Host "`n==> $server  (as $rdpUser)" -ForegroundColor Cyan
+    $server = $server.Trim()
+    Write-Host "`n==> $server" -ForegroundColor Cyan
+    $r = [ordered]@{ Server = $server; User = $User; PortOpen = $false; RdpEnabled = $null; CredValid = $null; RdpAccess = 'NO'; Reason = '' }
 
-    $r = [ordered]@{ Server = $server; User = $rdpUser; PortOpen = $false; RdpAccess = 'NO'; Reason = '' }
+    # 1. Port
+    try { $r.PortOpen = [bool](Test-NetConnection $server -Port $Port -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}
+    if (-not $r.PortOpen) { $r.Reason = "Port $Port closed/unreachable" }
 
-    # 1. Port check
-    try {
-        $r.PortOpen = [bool](Test-NetConnection -ComputerName $server -Port $Port -WarningAction SilentlyContinue).TcpTestSucceeded
-    } catch {}
-    if (-not $r.PortOpen) {
-        $r.Reason = "Port $Port closed/unreachable"
-        Write-Host "   RDP access: NO  $($r.Reason)" -ForegroundColor Red
-        [pscustomobject]$r; continue
-    }
-
-    if ($Mode -eq 'Session') {
-        # 2. Real login via mstsc, verified with quser
-        $existing = @(Get-RdpSessionIds $server $short)
-        $target = "TERMSRV/$server"
-        cmdkey /generic:$target /user:$rdpUser /pass:$Pass | Out-Null
-        $proc = Start-Process mstsc -ArgumentList "/v:$server" -PassThru
-
-        $newId = $null
-        $deadline = (Get-Date).AddSeconds($TimeoutSec)
-        while ((Get-Date) -lt $deadline -and -not $newId) {
-            Start-Sleep -Seconds 3
-            $newId = Get-RdpSessionIds $server $short | Where-Object { $_ -notin $existing } | Select-Object -First 1
-        }
-
-        if ($newId) {
-            $r.RdpAccess = 'YES'
-            Start-Sleep -Seconds 2
-            logoff $newId /server:$server 2>$null
-        } elseif ($existing.Count) {
-            $r.Reason = "User already had a session (id $($existing -join ',')) - couldn't verify a new login"
-        } else {
-            $r.Reason = "No session within ${TimeoutSec}s (bad creds / no RDP logon right / NLA or policy block)"
-        }
-
-        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-        Get-Process mstsc -ErrorAction SilentlyContinue | Where-Object { $_.Id -eq $proc.Id } | Stop-Process -Force -ErrorAction SilentlyContinue
-        cmdkey /delete:$target | Out-Null
-    }
-    else {
-        # 2. Precheck: password valid?
-        Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-        $credOk = $false
+    # 2. Password
+    if ($r.PortOpen) {
         try {
-            if ($rdpUser -like "$($server.Split('.')[0])\*") {
-                $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine', $server)
-            } else {
-                $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Domain')
-            }
-            $credOk = $ctx.ValidateCredentials((Get-ShortName $rdpUser), $Pass)
-        } catch { $r.Reason = "Cred check error: $($_.Exception.Message)" }
+            $ctx = if ($IsLocal) { New-Object DirectoryServices.AccountManagement.PrincipalContext('Machine', $server) }
+                   else          { New-Object DirectoryServices.AccountManagement.PrincipalContext('Domain') }
+            $r.CredValid = $ctx.ValidateCredentials($Sam, $Pass)
+            if (-not $r.CredValid) { $r.Reason = 'Invalid username/password (or account locked/disabled)' }
+        } catch { $r.CredValid = $false; $r.Reason = "Cred check error: $($_.Exception.Message)" }
+    }
 
-        if (-not $credOk) {
-            if (-not $r.Reason) { $r.Reason = 'Invalid username/password' }
-        } else {
-            # 3. RDP group membership (runs as the account executing the script)
-            try {
-                $members = Invoke-Command -ComputerName $server -ErrorAction Stop -ScriptBlock {
-                    @(Get-LocalGroupMember 'Remote Desktop Users' -ErrorAction SilentlyContinue) +
-                    @(Get-LocalGroupMember 'Administrators'       -ErrorAction SilentlyContinue) |
-                        ForEach-Object { $_.Name }
-                }
-                $hit = $members | Where-Object { (Get-ShortName $_) -ieq (Get-ShortName $rdpUser) }
-                if ($hit) { $r.RdpAccess = 'YES' }
-                else      { $r.Reason = "Creds OK, but user not directly in Remote Desktop Users/Administrators (check nested groups)" }
-            } catch { $r.Reason = "Creds OK, WinRM group check failed: $($_.Exception.Message)" }
-        }
+    # 3. RDP enabled + logon right (on target)
+    if ($r.CredValid) {
+        try {
+            $rc = Invoke-Command -ComputerName $server -ScriptBlock $remoteCheck -ArgumentList $Sam, $IsLocal -ErrorAction Stop
+            $r.RdpEnabled = $rc.RdpEnabled
+            if (-not $rc.RdpEnabled)   { $r.Reason = 'RDP disabled on server (fDenyTSConnections=1)' }
+            elseif ($rc.Allowed)       { $r.RdpAccess = 'YES'; $r.Reason = $rc.Detail }
+            else                       { $r.Reason = $rc.Detail }
+        } catch { $r.Reason = "Remote check failed (WinRM/admin?): $($_.Exception.Message)" }
     }
 
     $color = if ($r.RdpAccess -eq 'YES') { 'Green' } else { 'Red' }
     Write-Host "   RDP access: $($r.RdpAccess)  $($r.Reason)" -ForegroundColor $color
     [pscustomobject]$r
-}
-}
-finally {
-    if ($Mode -eq 'Session') {
-        if ($null -eq $origAuthLevel) { Remove-ItemProperty $tsKey -Name AuthenticationLevelOverride -ErrorAction SilentlyContinue }
-        else { Set-ItemProperty $tsKey -Name AuthenticationLevelOverride -Value $origAuthLevel -Type DWord }
-    }
 }
 
 # ============================== SUMMARY ==============================
@@ -167,10 +137,10 @@ $no  = @($results | Where-Object RdpAccess -ne 'YES')
 
 Write-Host "`n========== RDP ACCESS SUMMARY ==========" -ForegroundColor Yellow
 Write-Host "HAS ACCESS ($($yes.Count)):" -ForegroundColor Green
-$yes | ForEach-Object { Write-Host "  [YES] $($_.Server)" -ForegroundColor Green }
+$yes | ForEach-Object { Write-Host "  [YES] $($_.Server)  -> $($_.Reason)" -ForegroundColor Green }
 Write-Host "NO ACCESS ($($no.Count)):" -ForegroundColor Red
 $no  | ForEach-Object { Write-Host "  [NO]  $($_.Server)  -> $($_.Reason)" -ForegroundColor Red }
 
-$results | Format-Table Server, User, PortOpen, RdpAccess, Reason -AutoSize
+$results | Format-Table Server, PortOpen, RdpEnabled, CredValid, RdpAccess, Reason -AutoSize
 $results | Export-Csv -Path $OutCsv -NoTypeInformation
 Write-Host "Results saved to $OutCsv" -ForegroundColor Yellow
